@@ -1,0 +1,1032 @@
+"""
+Optimal Mortgage Refinancing Calculator
+Based on: "Optimal Mortgage Refinancing: A Closed Form Solution"
+By Sumit Agarwal, John C. Driscoll, and David Laibson
+NBER Working Paper No. 13487 (October 2007)
+"""
+
+import streamlit as st
+import numpy as np
+import pandas as pd
+import math
+
+# Try to import plotly, but don't fail if it's not available
+try:
+    import plotly.graph_objects as go
+    import plotly.express as px
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
+    st.warning("Plotly not available. Charts will be displayed using Streamlit's built-in charts.")
+
+# Import scipy's lambertw, with fallback implementation if not available
+try:
+    from scipy.special import lambertw
+except ImportError:
+    # Fallback implementation of Lambert W function
+    def lambertw(x):
+        """
+        Simple implementation of Lambert W function for x >= -1/e
+        Using Newton's method
+        """
+        # For x close to 0, use series expansion
+        if abs(x) < 1e-6:
+            return x - x**2 + 1.5 * x**3
+
+        # Initial guess
+        if x > 0:
+            w = np.log(max(x, 1e-16))
+        else:
+            w = x
+
+        # Newton's method iteration
+        for _ in range(50):
+            ew = np.exp(w)
+            w_new = w - (w * ew - x) / (ew * (w + 1))
+            if abs(w_new - w) < 1e-10:
+                break
+            w = w_new
+
+        return w
+
+# Page configuration
+st.set_page_config(
+    page_title="Optimal Mortgage Refinancing Calculator",
+    page_icon="🏠",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Helper function for creating charts with fallback
+def create_line_chart(data_dict, title, x_label, y_label, use_plotly=PLOTLY_AVAILABLE):
+    """Create a line chart using plotly if available, otherwise use streamlit"""
+    if use_plotly and PLOTLY_AVAILABLE:
+        fig = go.Figure()
+        for name, (x_data, y_data) in data_dict.items():
+            line_style = {}
+            if 'Approx' in name:
+                line_style['dash'] = 'dash'
+            elif 'NPV' in name:
+                line_style['dash'] = 'dot'
+            fig.add_trace(go.Scatter(x=x_data, y=y_data, mode='lines', name=name, line=line_style))
+
+        fig.update_layout(
+            title=title,
+            xaxis_title=x_label,
+            yaxis_title=y_label,
+            height=500,
+            hovermode='x unified'
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        # Prepare data for streamlit line chart
+        df_data = pd.DataFrame()
+        first_key = list(data_dict.keys())[0]
+        df_data[x_label] = data_dict[first_key][0]
+
+        for name, (_, y_data) in data_dict.items():
+            df_data[name] = y_data
+
+        st.line_chart(df_data.set_index(x_label))
+
+# Custom CSS for better styling
+st.markdown("""
+    <style>
+    .main-header {
+        font-size: 2.5rem;
+        color: #1f4788;
+        font-weight: bold;
+        margin-bottom: 0.5rem;
+    }
+    .sub-header {
+        font-size: 1.2rem;
+        color: #666;
+        margin-bottom: 2rem;
+    }
+    .formula-box {
+        background-color: #f0f2f6;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        margin: 1rem 0;
+        font-family: 'Courier New', monospace;
+    }
+    .result-box {
+        background-color: #e8f4ea;
+        padding: 1.5rem;
+        border-radius: 0.5rem;
+        border-left: 4px solid #4CAF50;
+        margin: 1rem 0;
+    }
+    .warning-box {
+        background-color: #fff3cd;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        border-left: 4px solid #ff9800;
+        margin: 1rem 0;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+# Title and description
+st.markdown('<div class="main-header">Optimal Mortgage Refinancing Calculator</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Based on the NBER Working Paper 13487 by Agarwal, Driscoll, and Laibson (2007)</div>', unsafe_allow_html=True)
+
+# Sidebar for inputs
+st.sidebar.header("📊 Input Parameters")
+st.sidebar.markdown("---")
+
+# Create tabs for different input sections
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["🏠 Main Calculator", "📈 Sensitivity Analysis", "📖 Paper Explanation", "🔧 Additional Tools", "💰 Points Analysis"])
+
+with st.sidebar:
+    st.subheader("Mortgage Information")
+    M = st.number_input(
+        "Remaining Mortgage Value ($)", 
+        min_value=10000, 
+        max_value=5000000, 
+        value=250000,
+        step=10000,
+        help="The remaining principal balance on your mortgage (M in the paper)"
+    )
+    
+    i0 = st.number_input(
+        "Original Mortgage Rate (%)", 
+        min_value=0.0, 
+        max_value=20.0, 
+        value=6.0,
+        step=0.1,
+        help="The interest rate on your current mortgage (i₀ in the paper)"
+    ) / 100
+    
+    st.subheader("Economic Parameters")
+    rho = st.number_input(
+        "Real Discount Rate (%)", 
+        min_value=0.0, 
+        max_value=20.0, 
+        value=5.0,
+        step=0.5,
+        help="Your personal discount rate (ρ in the paper, page 17)"
+    ) / 100
+    
+    sigma = st.number_input(
+        "Interest Rate Volatility", 
+        min_value=0.001, 
+        max_value=0.05, 
+        value=0.0109,
+        step=0.001,
+        format="%.4f",
+        help="Annual standard deviation of mortgage rate (σ in the paper, calibrated on page 18)"
+    )
+    
+    st.subheader("Tax & Cost Information")
+    tau = st.number_input(
+        "Marginal Tax Rate (%)", 
+        min_value=0.0, 
+        max_value=50.0, 
+        value=28.0,
+        step=1.0,
+        help="Your marginal tax rate (τ in the paper)"
+    ) / 100
+    
+    fixed_cost = st.number_input(
+        "Fixed Refinancing Cost ($)", 
+        min_value=0, 
+        max_value=20000, 
+        value=2000,
+        step=100,
+        help="Fixed costs like inspection, title insurance, lawyers (page 17)"
+    )
+    
+    points = st.number_input(
+        "Points (%)", 
+        min_value=0.0, 
+        max_value=5.0, 
+        value=1.0,
+        step=0.1,
+        help="Points charged as percentage of mortgage"
+    ) / 100
+    
+    st.subheader("Prepayment Parameters")
+    mu = st.number_input(
+        "Annual Probability of Moving (%)", 
+        min_value=0.0, 
+        max_value=50.0, 
+        value=10.0,
+        step=1.0,
+        help="Annual probability of relocating (μ in the paper)"
+    ) / 100
+    
+    pi = st.number_input(
+        "Expected Inflation Rate (%)", 
+        min_value=0.0, 
+        max_value=10.0, 
+        value=3.0,
+        step=0.5,
+        help="Expected inflation rate (π in the paper)"
+    ) / 100
+    
+    Gamma = st.number_input(
+        "Remaining Mortgage Years", 
+        min_value=1, 
+        max_value=30, 
+        value=25,
+        help="Years remaining on mortgage (Γ in the paper)"
+    )
+
+# Calculate derived parameters
+def calculate_lambda(mu, i0, Gamma, pi):
+    """Calculate λ (lambda) as per page 19 and Appendix C of the paper"""
+    if i0 * Gamma < 100:  # Prevent overflow
+        lambda_val = mu + i0 / (np.exp(i0 * Gamma) - 1) + pi
+    else:
+        lambda_val = mu + pi  # Simplified for very large values
+    return lambda_val
+
+def calculate_kappa(M, points, fixed_cost, tau):
+    """Calculate κ(M) - tax-adjusted refinancing cost (Appendix A)"""
+    # Simplified version - full formula in Appendix A
+    kappa = fixed_cost + points * M
+    return kappa
+
+def calculate_optimal_threshold(M, rho, lambda_val, sigma, kappa, tau):
+    """
+    Calculate the optimal refinancing threshold x* using Lambert W function
+    As per Theorem 2 (page 13) and equation (12)
+    """
+    # Calculate ψ (psi) as per equation in Theorem 2
+    psi = np.sqrt(2 * (rho + lambda_val)) / sigma
+    
+    # Calculate φ (phi) as per equation in Theorem 2
+    C_M = kappa / (1 - tau)  # Normalized refinancing cost
+    phi = 1 + psi * (rho + lambda_val) * C_M / M
+    
+    # Calculate x* using Lambert W function (equation 12)
+    # x* = (1/ψ)[φ + W(-exp(-φ))]
+    try:
+        w_arg = -np.exp(-phi)
+        w_val = np.real(lambertw(w_arg, k=0))
+        x_star = (1 / psi) * (phi + w_val)
+    except:
+        x_star = np.nan
+    
+    return x_star, psi, phi, C_M
+
+def calculate_square_root_approximation(M, rho, lambda_val, sigma, kappa, tau):
+    """
+    Calculate the square root approximation (second-order Taylor expansion)
+    As per Section 2.3 (page 16-17)
+    """
+    # Square root rule approximation
+    sqrt_term = sigma * np.sqrt(kappa / (M * (1 - tau))) * np.sqrt(2 * (rho + lambda_val))
+    return -sqrt_term
+
+def calculate_npv_threshold(M, rho, lambda_val, kappa, tau):
+    """
+    Calculate the NPV break-even threshold
+    As per Definition 3 (page 16)
+    """
+    C_M = kappa / (1 - tau)
+    x_npv = -(rho + lambda_val) * C_M / M
+    return x_npv
+
+# Main calculations
+lambda_val = calculate_lambda(mu, i0, Gamma, pi)
+kappa = calculate_kappa(M, points, fixed_cost, tau)
+x_star, psi, phi, C_M = calculate_optimal_threshold(M, rho, lambda_val, sigma, kappa, tau)
+x_star_sqrt = calculate_square_root_approximation(M, rho, lambda_val, sigma, kappa, tau)
+x_npv = calculate_npv_threshold(M, rho, lambda_val, kappa, tau)
+
+# Convert to basis points for display
+x_star_bp = -x_star * 10000 if not np.isnan(x_star) else np.nan
+x_star_sqrt_bp = -x_star_sqrt * 10000
+x_npv_bp = -x_npv * 10000
+
+with tab1:
+    st.header("📊 Optimal Refinancing Results")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.metric(
+            "Exact Optimal Threshold", 
+            f"{x_star_bp:.0f} bps" if not np.isnan(x_star_bp) else "N/A",
+            help="Refinance when current rate is this many basis points below original rate (Theorem 2, page 13)"
+        )
+    
+    with col2:
+        st.metric(
+            "Square Root Approximation", 
+            f"{x_star_sqrt_bp:.0f} bps",
+            f"{x_star_sqrt_bp - x_star_bp:.0f} bps difference" if not np.isnan(x_star_bp) else "N/A",
+            help="Second-order Taylor approximation (Section 2.3, page 16-17)"
+        )
+    
+    with col3:
+        st.metric(
+            "NPV Break-even Threshold", 
+            f"{x_npv_bp:.0f} bps",
+            f"{x_npv_bp - x_star_bp:.0f} bps difference" if not np.isnan(x_star_bp) else "N/A",
+            help="Simple NPV rule ignoring option value (Definition 3, page 16)"
+        )
+    
+    # Detailed breakdown
+    st.markdown("---")
+    st.subheader("📐 Solution Components (Theorem 2, page 13)")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("### Key Parameters")
+        st.markdown(f"""
+        <div class="formula-box">
+        <b>ψ (psi)</b> = √(2(ρ + λ))/σ<br>
+        ψ = √(2({rho:.3f} + {lambda_val:.3f}))/{sigma:.4f}<br>
+        <b>ψ = {psi:.4f}</b>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown(f"""
+        <div class="formula-box">
+        <b>φ (phi)</b> = 1 + ψ(ρ + λ)κ/(M(1-τ))<br>
+        φ = 1 + {psi:.4f}×({rho:.3f} + {lambda_val:.3f})×{kappa:.0f}/({M:.0f}×(1-{tau:.2f}))<br>
+        <b>φ = {phi:.4f}</b>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col2:
+        st.markdown("### Derived Values")
+        st.markdown(f"""
+        <div class="formula-box">
+        <b>λ (lambda)</b> = μ + i₀/(e^(i₀Γ) - 1) + π<br>
+        λ = {mu:.3f} + {i0:.3f}/(e^({i0:.3f}×{Gamma}) - 1) + {pi:.3f}<br>
+        <b>λ = {lambda_val:.4f}</b><br>
+        <i>(Equation from page 19, Appendix C)</i>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown(f"""
+        <div class="formula-box">
+        <b>C(M)</b> = κ(M)/(1-τ)<br>
+        C(M) = {kappa:.0f}/(1-{tau:.2f})<br>
+        <b>C(M) = ${C_M:.0f}</b><br>
+        <i>(Normalized refinancing cost, page 8)</i>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    # Final formula
+    st.markdown("### 🎯 Optimal Refinancing Rule (Equation 12)")
+    st.markdown(f"""
+    <div class="result-box">
+    <h4>x* = (1/ψ)[φ + W(-exp(-φ))]</h4>
+    <p>x* = (1/{psi:.4f})[{phi:.4f} + W(-exp(-{phi:.4f}))]</p>
+    <p><b>x* = {x_star:.6f}</b></p>
+    <p>Converting to basis points: <b>{x_star_bp:.0f} basis points</b></p>
+    <br>
+    <p><b>Decision Rule:</b> Refinance when the current mortgage rate falls <b>{x_star_bp:.0f} basis points</b> below your original rate of {i0*100:.1f}%</p>
+    <p><b>Refinance at or below:</b> {(i0 - abs(x_star))*100:.2f}%</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+with tab2:
+    st.header("📈 Sensitivity Analysis")
+    
+    # Choose parameter for sensitivity analysis
+    param_choice = st.selectbox(
+        "Select parameter to analyze:",
+        ["Mortgage Size (M)", "Interest Rate Volatility (σ)", "Discount Rate (ρ)", 
+         "Tax Rate (τ)", "Probability of Moving (μ)", "Refinancing Costs"]
+    )
+    
+    # Generate sensitivity data
+    if param_choice == "Mortgage Size (M)":
+        M_range = np.linspace(100000, 1000000, 50)
+        thresholds = []
+        sqrt_approx = []
+        npv_thresholds = []
+        
+        for M_test in M_range:
+            kappa_test = calculate_kappa(M_test, points, fixed_cost, tau)
+            x_test, _, _, _ = calculate_optimal_threshold(M_test, rho, lambda_val, sigma, kappa_test, tau)
+            x_sqrt_test = calculate_square_root_approximation(M_test, rho, lambda_val, sigma, kappa_test, tau)
+            x_npv_test = calculate_npv_threshold(M_test, rho, lambda_val, kappa_test, tau)
+            
+            thresholds.append(-x_test * 10000 if not np.isnan(x_test) else 0)
+            sqrt_approx.append(-x_sqrt_test * 10000)
+            npv_thresholds.append(-x_npv_test * 10000)
+        
+        # Use helper function to create chart with fallback
+        create_line_chart(
+            {
+                'Exact Optimal': (M_range/1000, thresholds),
+                'Square Root Approx': (M_range/1000, sqrt_approx),
+                'NPV Rule': (M_range/1000, npv_thresholds)
+            },
+            title="Refinancing Threshold vs Mortgage Size (Table 1, page 20)",
+            x_label="Mortgage Size ($1000s)",
+            y_label="Refinancing Threshold (basis points)"
+        )
+        
+    elif param_choice == "Interest Rate Volatility (σ)":
+        sigma_range = np.linspace(0.005, 0.025, 50)
+        thresholds = []
+        sqrt_approx = []
+        npv_thresholds = []
+        
+        for sigma_test in sigma_range:
+            x_test, _, _, _ = calculate_optimal_threshold(M, rho, lambda_val, sigma_test, kappa, tau)
+            x_sqrt_test = calculate_square_root_approximation(M, rho, lambda_val, sigma_test, kappa, tau)
+            x_npv_test = calculate_npv_threshold(M, rho, lambda_val, kappa, tau)
+            
+            thresholds.append(-x_test * 10000 if not np.isnan(x_test) else 0)
+            sqrt_approx.append(-x_sqrt_test * 10000)
+            npv_thresholds.append(-x_npv_test * 10000)
+        
+        # Use helper function to create chart with fallback
+        create_line_chart(
+            {
+                'Exact Optimal': (sigma_range, thresholds),
+                'Square Root Approx': (sigma_range, sqrt_approx),
+                'NPV Rule': (sigma_range, npv_thresholds)
+            },
+            title="Refinancing Threshold vs Interest Rate Volatility",
+            x_label="Interest Rate Volatility (σ)",
+            y_label="Refinancing Threshold (basis points)"
+        )
+    
+    elif param_choice == "Tax Rate (τ)":
+        tau_range = np.array([0, 0.10, 0.15, 0.25, 0.28, 0.33, 0.35])
+        thresholds = []
+        
+        for tau_test in tau_range:
+            kappa_test = calculate_kappa(M, points, fixed_cost, tau_test)
+            x_test, _, _, _ = calculate_optimal_threshold(M, rho, lambda_val, sigma, kappa_test, tau_test)
+            thresholds.append(-x_test * 10000 if not np.isnan(x_test) else 0)
+        
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=tau_range*100, y=thresholds, text=[f"{t:.0f} bps" for t in thresholds], textposition='outside'))
+        
+        fig.update_layout(
+            title="Refinancing Threshold vs Tax Rate (Table 2, page 20)",
+            xaxis_title="Marginal Tax Rate (%)",
+            yaxis_title="Refinancing Threshold (basis points)",
+            height=500
+        )
+    
+    elif param_choice == "Probability of Moving (μ)":
+        mu_range = np.linspace(0.05, 0.25, 50)
+        thresholds = []
+        
+        for mu_test in mu_range:
+            lambda_test = calculate_lambda(mu_test, i0, Gamma, pi)
+            x_test, _, _, _ = calculate_optimal_threshold(M, rho, lambda_test, sigma, kappa, tau)
+            thresholds.append(-x_test * 10000 if not np.isnan(x_test) else 0)
+        
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=1/mu_range, y=thresholds, mode='lines', line=dict(width=3)))
+        
+        fig.update_layout(
+            title="Refinancing Threshold vs Expected Time to Move (Table 3, page 21)",
+            xaxis_title="Expected Years Until Move (1/μ)",
+            yaxis_title="Refinancing Threshold (basis points)",
+            height=500
+        )
+    
+    elif param_choice == "Discount Rate (ρ)":
+        rho_range = np.linspace(0.02, 0.10, 50)
+        thresholds = []
+        
+        for rho_test in rho_range:
+            x_test, _, _, _ = calculate_optimal_threshold(M, rho_test, lambda_val, sigma, kappa, tau)
+            thresholds.append(-x_test * 10000 if not np.isnan(x_test) else 0)
+        
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=rho_range*100, y=thresholds, mode='lines', line=dict(width=3)))
+        
+        fig.update_layout(
+            title="Refinancing Threshold vs Discount Rate",
+            xaxis_title="Real Discount Rate (%)",
+            yaxis_title="Refinancing Threshold (basis points)",
+            height=500
+        )
+    
+    else:  # Refinancing Costs
+        cost_range = np.linspace(500, 5000, 50)
+        thresholds = []
+        sqrt_approx = []
+        npv_thresholds = []
+        
+        for cost_test in cost_range:
+            kappa_test = calculate_kappa(M, points, cost_test, tau)
+            x_test, _, _, _ = calculate_optimal_threshold(M, rho, lambda_val, sigma, kappa_test, tau)
+            x_sqrt_test = calculate_square_root_approximation(M, rho, lambda_val, sigma, kappa_test, tau)
+            x_npv_test = calculate_npv_threshold(M, rho, lambda_val, kappa_test, tau)
+            
+            thresholds.append(-x_test * 10000 if not np.isnan(x_test) else 0)
+            sqrt_approx.append(-x_sqrt_test * 10000)
+            npv_thresholds.append(-x_npv_test * 10000)
+        
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=cost_range, y=thresholds, mode='lines', name='Exact Optimal', line=dict(width=3)))
+        fig.add_trace(go.Scatter(x=cost_range, y=sqrt_approx, mode='lines', name='Square Root Approx', line=dict(dash='dash')))
+        fig.add_trace(go.Scatter(x=cost_range, y=npv_thresholds, mode='lines', name='NPV Rule', line=dict(dash='dot')))
+        
+        fig.update_layout(
+            title="Refinancing Threshold vs Fixed Costs (Related to Table 4, page 22)",
+            xaxis_title="Fixed Refinancing Cost ($)",
+            yaxis_title="Refinancing Threshold (basis points)",
+            height=500,
+            hovermode='x unified'
+        )
+    
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Show comparison table similar to paper
+    st.markdown("---")
+    st.subheader("📊 Comparison with Paper Results")
+    
+    if param_choice == "Mortgage Size (M)":
+        st.markdown("Compare with **Table 1** (page 20):")
+        comparison_data = {
+            'Mortgage': ['$1,000,000', '$500,000', '$250,000', '$100,000'],
+            'Paper (Exact)': [107, 118, 139, 193],
+            'Paper (2nd order)': [97, 106, 123, 163],
+            'Paper (NPV)': [27, 33, 44, 76]
+        }
+        st.dataframe(pd.DataFrame(comparison_data))
+    
+    elif param_choice == "Tax Rate (τ)":
+        st.markdown("Compare with **Table 2** (page 20) for $250,000 mortgage:")
+        comparison_data = {
+            'Tax Rate': ['0%', '10%', '15%', '25%', '28%', '33%', '35%'],
+            'Paper Results': [124, 129, 131, 137, 139, 143, 145]
+        }
+        st.dataframe(pd.DataFrame(comparison_data))
+
+with tab3:
+    st.header("📖 Paper Explanation & Key Concepts")
+    
+    st.markdown("""
+    ### 📑 Paper Overview
+    
+    This calculator implements the **first closed-form optimal refinancing rule** derived by Agarwal, Driscoll, and Laibson (2007).
+    
+    ### 🔑 Key Innovation
+    
+    Previous research required numerical methods to solve complex partial differential equations. This paper provides an exact, 
+    closed-form solution that can be calculated on a simple calculator.
+    
+    ### 📐 The Main Formula (Theorem 2, page 13)
+    
+    The optimal refinancing threshold is:
+    """)
+    
+    st.latex(r"x^* = \frac{1}{\psi}[\phi + W(-\exp(-\phi))]")
+    
+    st.markdown("""
+    Where:
+    - **x*** is the interest rate differential at which you should refinance
+    - **W(·)** is the Lambert W-function
+    - **ψ** and **φ** are parameters based on your specific situation
+    
+    ### 💡 Economic Intuition
+    
+    The optimal rule balances three key factors:
+    
+    1. **Interest Savings**: Lower rate saves money on future payments
+    2. **Refinancing Costs**: Upfront costs must be recouped
+    3. **Option Value**: Value of waiting for rates to potentially fall further
+    
+    ### 📊 Key Findings (Section 3, pages 17-22)
+    
+    - Optimal thresholds typically range from **100 to 200 basis points**
+    - Smaller mortgages require larger rate drops to justify refinancing
+    - Higher volatility increases the value of waiting
+    - Tax deductibility of interest affects the optimal threshold
+    
+    ### ⚠️ Common Mistakes (Section 5, pages 24-28)
+    
+    The paper shows that most financial advisors recommend the **NPV rule**, which:
+    - Ignores the option value of waiting
+    - Can lead to refinancing too early
+    - Results in expected losses of **$85,000+ on a $500,000 mortgage**
+    
+    ### 📈 Parameter Calibration (Section 3)
+    
+    The paper calibrates parameters using historical data:
+    - **σ = 0.0109**: Based on 30-year mortgage rate volatility (1971-2004)
+    - **ρ = 5%**: Typical real discount rate
+    - **τ = 28%**: Common marginal tax rate
+    - **μ = 10%**: Annual probability of moving
+    """)
+    
+    # Add comparison with Chen and Ling
+    st.markdown("---")
+    st.subheader("🔄 Validation (Section 4, pages 22-24)")
+    
+    st.markdown("""
+    The paper validates their closed-form solution against Chen and Ling (1989), who used numerical methods:
+    
+    | Refinancing Cost | Chen & Ling | This Paper | Difference |
+    |-----------------|-------------|------------|------------|
+    | 4.24 points | 228 bps | 218 bps | 10 bps |
+    | 5.51 points | 256 bps | 255 bps | 1 bp |
+    
+    The close agreement validates the simplifying assumptions used to derive the closed-form solution.
+    """)
+
+with tab4:
+    st.header("🔧 Additional Analysis Tools")
+    
+    tool_choice = st.selectbox(
+        "Select Analysis Tool:",
+        ["Welfare Loss Calculator", "Break-even Analysis", "Historical Rate Comparison"]
+    )
+    
+    if tool_choice == "Welfare Loss Calculator":
+        st.subheader("💰 Welfare Loss from Suboptimal Rules (Section 5, pages 25-28)")
+        
+        st.markdown("""
+        The paper derives the expected loss from using the NPV rule instead of the optimal rule (Proposition 4, page 25-26).
+        """)
+        
+        # Calculate welfare loss
+        loss_npv = (np.exp(psi * abs(x_star)) / (psi * (rho + lambda_val))) * M if not np.isnan(x_star) else 0
+        loss_sqrt = 0  # Would need more complex calculation
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown(f"""
+            <div class="warning-box">
+            <h4>Loss from NPV Rule</h4>
+            <p>Expected Loss: <b>${loss_npv:,.0f}</b></p>
+            <p>As % of Mortgage: <b>{(loss_npv/M)*100:.1f}%</b></p>
+            <p><i>Based on equation (25), page 27</i></p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col2:
+            # Show table from paper
+            st.markdown("**Table 6** from paper (page 28):")
+            loss_data = {
+                'Mortgage': ['$1M', '$500K', '$250K', '$100K'],
+                'NPV Loss (%)': [16.3, 17.4, 19.6, 26.8]
+            }
+            st.dataframe(pd.DataFrame(loss_data))
+    
+    elif tool_choice == "Break-even Analysis":
+        st.subheader("📊 NPV Break-even Analysis")
+        
+        st.markdown("""
+        This tool shows when you'll recoup your refinancing costs under different scenarios.
+        This is the simple NPV rule that **ignores option value**.
+        """)
+        
+        current_rate = st.number_input("Current Market Rate (%)", 0.0, 20.0, 4.5, 0.1) / 100
+        rate_diff = i0 - current_rate
+        
+        if rate_diff > 0:
+            annual_savings = M * rate_diff * (1 - tau)
+            payback_period = kappa / annual_savings if annual_savings > 0 else float('inf')
+            
+            st.markdown(f"""
+            <div class="result-box">
+            <h4>NPV Break-even Analysis</h4>
+            <p>Rate Reduction: <b>{rate_diff*10000:.0f} basis points</b></p>
+            <p>Annual Interest Savings: <b>${annual_savings:,.0f}</b></p>
+            <p>Refinancing Cost: <b>${kappa:,.0f}</b></p>
+            <p>Payback Period: <b>{payback_period:.1f} years</b></p>
+            <br>
+            <p><b>Note:</b> This ignores the option value of waiting!</p>
+            <p>Optimal threshold suggests waiting until rates drop <b>{x_star_bp:.0f} bps</b></p>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.warning("Current rate must be lower than original rate for refinancing to make sense.")
+    
+    else:  # Historical Rate Comparison
+        st.subheader("📈 Historical Context")
+        
+        st.markdown("""
+        ### Historical 30-Year Mortgage Rates
+        
+        The paper uses data from 1971-2004 to calibrate σ = 0.0109.
+        
+        Key periods mentioned in the paper:
+        - **1980s-1990s**: Generally falling rates, many failed to refinance despite deep in-the-money options
+        - **1996-2003**: Over 1/3 of borrowers refinanced too early
+        
+        ### Current Application
+        
+        Your current situation:
+        """)
+        
+        st.markdown(f"""
+        - Original Rate: **{i0*100:.1f}%**
+        - Optimal Refinancing Threshold: **{x_star_bp:.0f} basis points**
+        - Refinance when rates reach: **{(i0 - abs(x_star))*100:.2f}%**
+        
+        Remember: The optimal threshold accounts for:
+        1. Direct costs of refinancing
+        2. The value of waiting for potentially better rates
+        3. The probability you might move before capturing full benefits
+        """)
+
+with tab5:
+    st.header("💰 Points vs Lender Credit Analysis")
+
+    st.markdown("""
+    This tool analyzes the optimal rate/cost combination by comparing different closing cost scenarios.
+    It helps determine whether to buy points (pay more upfront for lower rate) or take lender credits
+    (higher rate but lower upfront costs).
+    """)
+
+    # Get the base parameters
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        par_closing_costs = st.number_input(
+            "Total Closing Costs at Par ($)",
+            min_value=0,
+            max_value=50000,
+            value=5000,
+            step=500,
+            help="Total refinancing costs at the par rate (no points/credits)"
+        )
+
+    with col2:
+        par_rate = st.number_input(
+            "Par Rate (%)",
+            min_value=0.0,
+            max_value=20.0,
+            value=4.5,
+            step=0.125,
+            help="The rate with no points or lender credits"
+        ) / 100
+
+    with col3:
+        points_cost_per_point = st.number_input(
+            "Cost per Point (%)",
+            min_value=0.0,
+            max_value=2.0,
+            value=1.0,
+            step=0.25,
+            help="Percentage of loan amount per discount point"
+        ) / 100
+
+    # Additional parameters for points pricing
+    rate_change_per_point = st.number_input(
+        "Rate Change per Point (%)",
+        min_value=0.0,
+        max_value=0.5,
+        value=0.25,
+        step=0.125,
+        help="How much the rate changes per point (typically 0.25%)"
+    ) / 100
+
+    st.markdown("---")
+
+    # Table 1: Closing Costs → Optimal Rate
+    st.subheader("📊 Table 1: Optimal Rate by Closing Costs")
+    st.markdown("Shows what interest rate makes refinancing optimal at different closing cost levels")
+
+    # Generate closing cost range
+    cost_increments = []
+    cost = 0
+    while cost <= par_closing_costs * 4:
+        cost_increments.append(cost)
+        cost += 500
+
+    # Calculate optimal rates for each closing cost level
+    optimal_rates_by_cost = []
+
+    for closing_cost in cost_increments:
+        # Recalculate kappa with new closing cost
+        temp_kappa = closing_cost
+
+        # Calculate the optimal threshold with this closing cost
+        temp_x_star, _, _, _ = calculate_optimal_threshold(M, rho, lambda_val, sigma, temp_kappa, tau)
+
+        # The optimal rate is the original rate minus the threshold
+        optimal_rate = i0 + temp_x_star  # x_star is negative
+
+        optimal_rates_by_cost.append({
+            'Closing Costs ($)': f"${closing_cost:,.0f}",
+            'Optimal Rate (%)': f"{optimal_rate * 100:.3f}%",
+            'Rate Drop Needed (bps)': f"{-temp_x_star * 10000:.0f}"
+        })
+
+    # Display as dataframe
+    df_cost_to_rate = pd.DataFrame(optimal_rates_by_cost)
+    st.dataframe(df_cost_to_rate, use_container_width=True)
+
+    # Download button for Table 1
+    csv1 = df_cost_to_rate.to_csv(index=False)
+    st.download_button(
+        label="Download Table 1 as CSV",
+        data=csv1,
+        file_name="optimal_rate_by_closing_costs.csv",
+        mime="text/csv"
+    )
+
+    st.markdown("---")
+
+    # Table 2: Rate → Closing Costs with Actual Comparison
+    st.subheader("📊 Table 2: Closing Costs by Rate (with Lender Quote Comparison)")
+    st.markdown("Compare model-implied costs with actual lender quotes to identify the best deals")
+
+    # Generate rate range (par rate ± 1.5% in 1/16 increments)
+    rate_increments = []
+    rate = par_rate - 0.015
+    while rate <= par_rate + 0.015:
+        rate_increments.append(rate)
+        rate += 0.000625  # 1/16 of 1%
+
+    # Calculate implied closing costs for each rate
+    rate_to_cost_data = []
+
+    for rate in rate_increments:
+        # Rate difference from par
+        rate_diff_from_par = rate - par_rate
+
+        # Calculate implied points/credits
+        # Negative = lender credit, Positive = points
+        points_credits = rate_diff_from_par / rate_change_per_point
+
+        # Calculate implied closing costs
+        # Higher rate = lower costs (lender credit)
+        # Lower rate = higher costs (paying points)
+        implied_closing_cost = par_closing_costs + (points_credits * M * points_cost_per_point)
+
+        rate_to_cost_data.append({
+            'Rate': rate,
+            'Rate_Display': f"{rate * 100:.4f}%",
+            'Model_Closing_Costs': implied_closing_cost,
+            'Points_Credits': -points_credits  # Negative for display (positive = credit)
+        })
+
+    # Create dataframe
+    df_rate_to_cost = pd.DataFrame(rate_to_cost_data)
+
+    # Add input fields for actual costs
+    st.markdown("### Enter Actual Lender Quotes:")
+    st.markdown("Input the actual closing costs offered by lenders for each rate to compare with model predictions")
+
+    # Create editable dataframe
+    edited_df = st.data_editor(
+        df_rate_to_cost[['Rate_Display', 'Model_Closing_Costs']].copy(),
+        column_config={
+            'Rate_Display': st.column_config.TextColumn('Rate (%)', disabled=True),
+            'Model_Closing_Costs': st.column_config.NumberColumn(
+                'Model Closing Costs ($)',
+                disabled=True,
+                format="$%.0f"
+            ),
+            'Actual_Costs': st.column_config.NumberColumn(
+                'Actual Lender Costs ($)',
+                format="$%.0f",
+                default=0
+            )
+        },
+        num_rows="fixed",
+        hide_index=True,
+        use_container_width=True
+    )
+
+    # Add actual costs column
+    edited_df['Actual_Costs'] = 0  # Initialize column
+
+    # Add difference column
+    if 'Actual_Costs' in edited_df.columns:
+        edited_df['Difference'] = edited_df['Model_Closing_Costs'] - edited_df['Actual_Costs']
+        edited_df['Better_Deal'] = edited_df['Difference'].apply(
+            lambda x: '✅ Better' if x > 100 else ('❌ Worse' if x < -100 else '➖ Similar')
+        )
+
+    # Display summary statistics
+    st.markdown("### Analysis Summary:")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        if 'Actual_Costs' in edited_df.columns and edited_df['Actual_Costs'].sum() > 0:
+            best_deal_idx = edited_df['Difference'].idxmax()
+            best_rate = edited_df.loc[best_deal_idx, 'Rate_Display']
+            best_savings = edited_df.loc[best_deal_idx, 'Difference']
+            st.metric("Best Deal Rate", best_rate, f"${best_savings:,.0f} savings")
+
+    with col2:
+        par_idx = edited_df.index[edited_df['Rate_Display'] == f"{par_rate * 100:.4f}%"].tolist()
+        if par_idx:
+            par_difference = edited_df.loc[par_idx[0], 'Difference'] if 'Difference' in edited_df.columns else 0
+            st.metric("Par Rate Analysis", f"{par_rate * 100:.2f}%", f"${par_difference:,.0f}")
+
+    with col3:
+        if 'Difference' in edited_df.columns:
+            avg_difference = edited_df['Difference'].mean()
+            st.metric("Average Model vs Actual", f"${avg_difference:,.0f}",
+                     "Model predicts higher" if avg_difference > 0 else "Lender quotes higher")
+
+    # Download button for Table 2
+    csv2 = edited_df.to_csv(index=False)
+    st.download_button(
+        label="Download Table 2 as CSV",
+        data=csv2,
+        file_name="closing_costs_by_rate_comparison.csv",
+        mime="text/csv"
+    )
+
+    # Add visualization
+    st.markdown("---")
+    st.subheader("📈 Visual Analysis")
+
+    # Create visualization comparing model vs actual costs
+    if 'Actual_Costs' in edited_df.columns and edited_df['Actual_Costs'].sum() > 0:
+        if PLOTLY_AVAILABLE:
+            fig = go.Figure()
+
+            # Model costs line
+            fig.add_trace(go.Scatter(
+                x=df_rate_to_cost['Rate'] * 100,
+                y=df_rate_to_cost['Model_Closing_Costs'],
+                mode='lines',
+                name='Model Predicted Costs',
+                line=dict(color='blue', width=2)
+            ))
+
+            # Actual costs scatter
+            actual_data = edited_df[edited_df['Actual_Costs'] > 0]
+            if not actual_data.empty:
+                fig.add_trace(go.Scatter(
+                    x=df_rate_to_cost.loc[actual_data.index, 'Rate'] * 100,
+                    y=actual_data['Actual_Costs'],
+                    mode='markers',
+                    name='Actual Lender Quotes',
+                    marker=dict(color='red', size=10)
+                ))
+
+            fig.update_layout(
+                title="Model Predicted vs Actual Closing Costs",
+                xaxis_title="Interest Rate (%)",
+                yaxis_title="Closing Costs ($)",
+                hovermode='x unified',
+                showlegend=True
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            # Fallback to Streamlit line chart
+            chart_data = pd.DataFrame({
+                'Rate (%)': df_rate_to_cost['Rate'] * 100,
+                'Model Predicted Costs': df_rate_to_cost['Model_Closing_Costs']
+            })
+
+            actual_data = edited_df[edited_df['Actual_Costs'] > 0]
+            if not actual_data.empty:
+                chart_data['Actual Lender Quotes'] = np.nan
+                chart_data.loc[actual_data.index, 'Actual Lender Quotes'] = actual_data['Actual_Costs']
+
+            st.line_chart(chart_data.set_index('Rate (%)'), height=400)
+
+    # Recommendation based on analysis
+    st.markdown("---")
+    st.subheader("💡 Recommendations")
+
+    if 'Difference' in edited_df.columns and edited_df['Actual_Costs'].sum() > 0:
+        best_deals = edited_df.nlargest(3, 'Difference')
+
+        st.success(f"""
+        **Based on your inputs and lender quotes:**
+
+        1. **Best Value**: {best_deals.iloc[0]['Rate_Display']} rate saves ${best_deals.iloc[0]['Difference']:,.0f} vs model
+        2. **Consider**: Rates where lender quotes are significantly below model predictions
+        3. **Avoid**: Rates where lender quotes exceed model by more than $500
+
+        **Key Insight**: The model assumes standard pricing. Better-than-model deals often indicate:
+        - Promotional pricing
+        - Relationship discounts
+        - Competitive market conditions
+        """)
+    else:
+        st.info("""
+        **To get personalized recommendations:**
+
+        1. Get rate quotes from multiple lenders
+        2. Enter the total closing costs for each rate in Table 2
+        3. The tool will identify which rate/cost combination provides the best value
+
+        **General Guidance**:
+        - **Buy points** if you'll stay in the home long-term (>5-7 years)
+        - **Take credits** if you might move/refinance soon (<3-5 years)
+        - **Go with par** if uncertain about timeline
+        """)
+
+# Footer
+st.markdown("---")
+st.markdown("""
+<div style='text-align: center; color: #666; padding: 20px;'>
+<p><b>Reference:</b> Agarwal, S., Driscoll, J. C., & Laibson, D. (2007). 
+"Optimal Mortgage Refinancing: A Closed Form Solution" NBER Working Paper No. 13487</p>
+<p>Calculator implementation for educational purposes</p>
+</div>
+""", unsafe_allow_html=True)
